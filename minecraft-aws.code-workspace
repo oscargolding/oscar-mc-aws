@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "service-cdk"
+		},
+		{
+			"path": "server-docker"
+		}
+	],
+	"settings": {}
+}

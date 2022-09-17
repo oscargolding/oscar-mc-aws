@@ -8,7 +8,6 @@ import { constants } from './constants';
 import { Port } from "aws-cdk-lib/aws-ec2";
 import * as path from 'path';
 import { Protocol } from "aws-cdk-lib/aws-ecs";
-import { SSMParameterReader } from "./ssm-paramater-reader";
 
 interface MinecraftStackProps extends StackProps {
     config: Readonly<StackConfig>
@@ -27,12 +26,11 @@ export class MinecraftStack extends Stack {
 
         const fileSystem = new aws_efs.FileSystem(this, 'Filesystem', {
             vpc,
-            removalPolicy: RemovalPolicy.SNAPSHOT
+            removalPolicy: RemovalPolicy.DESTROY
         });
 
         const accessPoint = new aws_efs.AccessPoint(this, 'AccessPoint', {
             fileSystem,
-            path: '/minecraft',
             posixUser: {
                 uid: '1000',
                 gid: '1000',
@@ -107,27 +105,22 @@ export class MinecraftStack extends Stack {
             }
         );
 
-        const minecraftServerContainer = new aws_ecs.ContainerDefinition(
-            this,
-            'ServerContainer',
-            {
-                containerName: constants.MC_SERVER_CONTAINER_NAME,
-                image: aws_ecs.ContainerImage.fromAsset(path.resolve(__dirname, '../../server-docker')),
-                portMappings: [
-                    {
-                        containerPort: javaConfig.port,
-                        hostPort: javaConfig.port,
-                        protocol: javaConfig.protocol
-                    }
-                ],
-                essential: false,
-                taskDefinition,
-                logging: config.debug ? new aws_ecs.AwsLogDriver({
-                    logRetention: aws_logs.RetentionDays.THREE_DAYS,
-                    streamPrefix: constants.MC_SERVER_CONTAINER_NAME
-                }) : undefined
-            }
-        );
+        const minecraftServerContainer = taskDefinition.addContainer('ServerContainer', {
+            containerName: constants.MC_SERVER_CONTAINER_NAME,
+            image: aws_ecs.ContainerImage.fromAsset(path.resolve(__dirname, '../../server-docker')),
+            portMappings: [
+                {
+                    containerPort: javaConfig.port,
+                    hostPort: javaConfig.port,
+                    protocol: javaConfig.protocol
+                }
+            ],
+            essential: true,
+            logging: config.debug ? new aws_ecs.AwsLogDriver({
+                logRetention: aws_logs.RetentionDays.THREE_DAYS,
+                streamPrefix: constants.MC_SERVER_CONTAINER_NAME
+            }) : undefined
+        })
 
         minecraftServerContainer.addMountPoints({
             containerPath: '/data',
@@ -147,6 +140,12 @@ export class MinecraftStack extends Stack {
         serviceSecurityGroup.addIngressRule(
             aws_ec2.Peer.anyIpv4(),
             javaConfig.ingressRulePort
+        );
+
+        serviceSecurityGroup.addIngressRule(
+            aws_ec2.Peer.anyIpv4(),
+            aws_ec2.Port.tcp(22),
+            'allow ssh access from anywhere in the world'
         );
 
         const mincecraftServerService = new aws_ecs.FargateService(
@@ -174,62 +173,6 @@ export class MinecraftStack extends Stack {
             mincecraftServerService.connections
         );
 
-        const hostedZoneId = new SSMParameterReader(
-            this,
-            'Route53HostedZoneIdReader',
-            {
-                parameterName: constants.HOSTED_ZONE_SSM_PARAMETER,
-                region: constants.DOMAIN_STACK_REGION,
-            }).getParameterValue();
-
-        let snsTopicArn = '';
-
-        if (config.snsEmailAddress) {
-            const snsTopic = new aws_sns.Topic(this, 'ServerSnsTopic', {
-                displayName: 'Minecraft Server Notifications'
-            });
-
-            snsTopic.grantPublish(ecsTaskRole);
-
-            const emailSubscription = new aws_sns.Subscription(
-                this,
-                'EmailSubscription',
-                {
-                    protocol: aws_sns.SubscriptionProtocol.EMAIL,
-                    topic: snsTopic,
-                    endpoint: config.snsEmailAddress
-                }
-            );
-
-            snsTopicArn = snsTopic.topicArn;
-        }
-
-        const watchDogContainer = new aws_ecs.ContainerDefinition(
-            this,
-            'WatchDogContainer',
-            {
-                containerName: constants.WATCHDOG_SERVER_CONTAINER_NAME,
-                image: aws_ecs.ContainerImage.fromRegistry(
-                    'doctorray/minecraft-ecsfargate-watchdog'),
-                essential: true,
-                taskDefinition: taskDefinition,
-                environment: {
-                    CLUSTER: constants.CLUSTER_NAME,
-                    SERVICE: constants.SERVICE_NAME,
-                    DNSZONE: hostedZoneId,
-                    SERVERNAME: `${config.subdomainPart}.${config.domainName}`,
-                    SNSTOPIC: snsTopicArn,
-                    STARTUPMIN: config.startupMinutes,
-                    SHUTDOWNMIN: config.shutdownMinutes,
-                },
-                logging: config.debug
-                    ? new aws_ecs.AwsLogDriver({
-                        logRetention: aws_logs.RetentionDays.THREE_DAYS,
-                        streamPrefix: constants.WATCHDOG_SERVER_CONTAINER_NAME,
-                    })
-                    : undefined,
-            }
-        );
 
         const serviceControlPolicy = new aws_iam.Policy(this, 'ServiceControlPolicy', {
             statements: [
@@ -256,44 +199,7 @@ export class MinecraftStack extends Stack {
                     resources: ['*']
                 })
             ]
-        })
-
-        serviceControlPolicy.attachToRole(ecsTaskRole);
-
-        // Add the service control to lambda
-
-        const launcherLambdaRoleArn = new SSMParameterReader(
-            this,
-            'launcherLambdaRoleArn',
-            {
-                parameterName: constants.LAUNCHER_LAMBDA_ARN_SSM_PARAMETER,
-                region: constants.DOMAIN_STACK_REGION,
-            }
-        ).getParameterValue();
-
-        const launcherLambdaRole = aws_iam.Role.fromRoleArn(
-            this,
-            'LauncherLambdaRole',
-            launcherLambdaRoleArn
-        );
-
-        serviceControlPolicy.attachToRole(launcherLambdaRole);
-
-        // Give permission to update the associated A record
-        const iamRoute53Policy = new aws_iam.Policy(this, 'IamRoute53Policy', {
-            statements: [
-                new aws_iam.PolicyStatement({
-                    sid: 'AllowEditRecordSets',
-                    effect: aws_iam.Effect.ALLOW,
-                    actions: [
-                        'route53:GetHostedZone',
-                        'route53:ChangeResourceRecordSets',
-                        'route53:ListResourceRecordSets',
-                    ],
-                    resources: [`arn:aws:route53:::hostedzone/${hostedZoneId}`],
-                }),
-            ]
         });
-        iamRoute53Policy.attachToRole(ecsTaskRole);
+        serviceControlPolicy.attachToRole(ecsTaskRole);
     }
 }
